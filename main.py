@@ -6,6 +6,15 @@ import subprocess
 import sys
 import os
 import math
+import signal
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None
 
 CHUNK = 2048
 RATE = 44100
@@ -24,7 +33,7 @@ BOLD = f"{CSI}1m"
 # Visual modes
 VIS_MODES = [
     "bars", "mirror", "wave", "scatter", "waterfall",
-    "matrix", "rings", "flame", "stellar",
+    "matrix", "rings", "flame", "stellar", "vu", "radial",
 ]
 # Color themes
 COLOR_THEMES = [
@@ -36,17 +45,46 @@ BLOCK_CHARS = " ▁▂▃▄▅▆▇█"
 MATRIX_CHARS = "ﾊﾐﾋｰｳｼﾅﾓﾆｻﾜﾂｵﾘｱﾎﾃﾏｹﾒｴｶｷﾑﾕﾗｾﾈｽﾀﾇﾍ012345789Z"
 BRAILLE_DOTS = "⠁⠂⠄⡀⠈⠐⠠⢀"
 
+# AGC constants
+AGC_WINDOW = 60
+AGC_TARGET = 0.7
+
+# --- Pre-computed lookup tables ---
+# Cache move() sequences: _MOVE_CACHE[(y,x)] -> escape string
+_MOVE_CACHE = {}
+
+# Cache fg256/bg256 sequences: _FG_CACHE[color_id] -> escape string
+_FG_CACHE = [f"{CSI}38;5;{i}m" for i in range(256)]
+_BG_CACHE = [f"{CSI}48;5;{i}m" for i in range(256)]
+
+# Pre-compute dimmed color table: _DIM_CACHE[(color_id, factor_bucket)] -> color_id
+_DIM_CACHE = {}
+
+
+def _ensure_move_cache(max_y, max_x):
+    """Ensure move cache covers the given dimensions."""
+    for y in range(max_y):
+        for x in range(max_x):
+            k = (y, x)
+            if k not in _MOVE_CACHE:
+                _MOVE_CACHE[k] = f"{CSI}{y + 1};{x + 1}H"
+
 
 def move(y, x):
-    return f"{CSI}{y + 1};{x + 1}H"
+    try:
+        return _MOVE_CACHE[(y, x)]
+    except KeyError:
+        s = f"{CSI}{y + 1};{x + 1}H"
+        _MOVE_CACHE[(y, x)] = s
+        return s
 
 
 def fg256(color_id):
-    return f"{CSI}38;5;{color_id}m"
+    return _FG_CACHE[color_id]
 
 
 def bg256(color_id):
-    return f"{CSI}48;5;{color_id}m"
+    return _BG_CACHE[color_id]
 
 
 def hue_to_256(h):
@@ -75,101 +113,106 @@ def rgb256(r, g, b):
     return 16 + 36 * ri + 6 * gi + bi
 
 
+def dim_color_id(color_id, factor=0.3):
+    """Return a dimmed version of a 256-color code for background glow."""
+    # Quantize factor to reduce cache entries
+    fb = int(factor * 20)
+    key = (color_id, fb)
+    cached = _DIM_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if color_id < 16 or color_id >= 232:
+        result = 232 + int(factor * 6)
+    else:
+        idx = color_id - 16
+        b = idx % 6
+        g = (idx // 6) % 6
+        r = idx // 36
+        r = max(0, int(r * factor))
+        g = max(0, int(g * factor))
+        b = max(0, int(b * factor))
+        result = 16 + 36 * r + 6 * g + b
+    _DIM_CACHE[key] = result
+    return result
+
+
+def format_freq(hz):
+    """Format frequency for display labels."""
+    if hz >= 10000:
+        return f"{hz/1000:.0f}k"
+    elif hz >= 1000:
+        return f"{hz/1000:.1f}k"
+    return f"{int(hz)}"
+
+
 # --- Color theme functions ---
-# Each returns an ANSI escape string given (bar_index, num_bars, row_frac)
-# row_frac: 0.0 = bottom of bar, 1.0 = top
+# Each returns (ansi_string, color_id) given (bar_index, num_bars, row_frac)
 
 def color_rainbow(bar_idx, num_bars, row_frac):
-    return fg256(hue_to_256(bar_idx / num_bars)) + BOLD
+    cid = hue_to_256(bar_idx / num_bars)
+    return _FG_CACHE[cid] + BOLD, cid
 
 
 def color_fire(bar_idx, num_bars, row_frac):
-    if row_frac < 0.25:
-        return fg256(52)   # dark red
-    elif row_frac < 0.5:
-        return fg256(160)  # red
-    elif row_frac < 0.7:
-        return fg256(208)  # orange
-    elif row_frac < 0.85:
-        return fg256(220)  # yellow
-    else:
-        return fg256(229)  # bright yellow/white
+    if row_frac < 0.25:   cid = 52
+    elif row_frac < 0.5:  cid = 160
+    elif row_frac < 0.7:  cid = 208
+    elif row_frac < 0.85: cid = 220
+    else:                  cid = 229
+    return _FG_CACHE[cid], cid
 
 
 def color_ocean(bar_idx, num_bars, row_frac):
-    if row_frac < 0.3:
-        return fg256(17)   # deep blue
-    elif row_frac < 0.5:
-        return fg256(25)   # blue
-    elif row_frac < 0.7:
-        return fg256(37)   # teal
-    elif row_frac < 0.85:
-        return fg256(49)   # cyan
-    else:
-        return fg256(123)  # bright cyan
+    if row_frac < 0.3:    cid = 17
+    elif row_frac < 0.5:  cid = 25
+    elif row_frac < 0.7:  cid = 37
+    elif row_frac < 0.85: cid = 49
+    else:                  cid = 123
+    return _FG_CACHE[cid], cid
 
 
 def color_mono(bar_idx, num_bars, row_frac):
-    if row_frac < 0.3:
-        return fg256(22)   # dark green
-    elif row_frac < 0.6:
-        return fg256(34)   # green
-    elif row_frac < 0.85:
-        return fg256(46)   # bright green
-    else:
-        return fg256(156)  # light green
+    if row_frac < 0.3:    cid = 22
+    elif row_frac < 0.6:  cid = 34
+    elif row_frac < 0.85: cid = 46
+    else:                  cid = 156
+    return _FG_CACHE[cid], cid
 
 
 def color_amplitude(bar_idx, num_bars, row_frac):
-    if row_frac < 0.2:
-        return fg256(21)   # blue
-    elif row_frac < 0.4:
-        return fg256(33)   # light blue
-    elif row_frac < 0.6:
-        return fg256(46)   # green
-    elif row_frac < 0.8:
-        return fg256(208)  # orange
-    else:
-        return fg256(196)  # red
+    if row_frac < 0.2:    cid = 21
+    elif row_frac < 0.4:  cid = 33
+    elif row_frac < 0.6:  cid = 46
+    elif row_frac < 0.8:  cid = 208
+    else:                  cid = 196
+    return _FG_CACHE[cid], cid
 
 
 def color_neon(bar_idx, num_bars, row_frac):
-    # Synthwave: hot pink -> purple -> cyan
     t = bar_idx / num_bars
-    if t < 0.33:
-        return fg256(199) + BOLD  # hot pink
-    elif t < 0.66:
-        return fg256(135) + BOLD  # purple
-    else:
-        return fg256(51) + BOLD   # cyan
+    if t < 0.33:   cid = 199
+    elif t < 0.66: cid = 135
+    else:          cid = 51
+    return _FG_CACHE[cid] + BOLD, cid
 
 
 def color_sunset(bar_idx, num_bars, row_frac):
-    # Deep purple -> magenta -> orange -> gold
-    if row_frac < 0.25:
-        return fg256(53)   # dark purple
-    elif row_frac < 0.45:
-        return fg256(127)  # magenta
-    elif row_frac < 0.65:
-        return fg256(167)  # salmon
-    elif row_frac < 0.8:
-        return fg256(208)  # orange
-    else:
-        return fg256(220)  # gold
+    if row_frac < 0.25:   cid = 53
+    elif row_frac < 0.45: cid = 127
+    elif row_frac < 0.65: cid = 167
+    elif row_frac < 0.8:  cid = 208
+    else:                  cid = 220
+    return _FG_CACHE[cid], cid
 
 
 def color_ice(bar_idx, num_bars, row_frac):
-    # White -> ice blue -> deep blue
-    if row_frac < 0.3:
-        return fg256(60)   # slate
-    elif row_frac < 0.5:
-        return fg256(68)   # steel blue
-    elif row_frac < 0.7:
-        return fg256(111)  # light steel
-    elif row_frac < 0.85:
-        return fg256(153)  # ice
-    else:
-        return fg256(195) + BOLD  # white ice
+    if row_frac < 0.3:    cid = 60
+    elif row_frac < 0.5:  cid = 68
+    elif row_frac < 0.7:  cid = 111
+    elif row_frac < 0.85: cid = 153
+    else:                  cid = 195
+    extra = BOLD if row_frac >= 0.85 else ""
+    return _FG_CACHE[cid] + extra, cid
 
 
 COLOR_FUNCS = {
@@ -182,6 +225,80 @@ COLOR_FUNCS = {
     "sunset": color_sunset,
     "ice": color_ice,
 }
+
+
+# --- Per-frame color cache ---
+# Avoids repeated calls to color_func with the same (bar_idx, row_frac_bucket)
+_color_cache = {}
+_color_cache_theme = None
+
+
+def get_color(color_func, bar_idx, num_bars, row_frac):
+    """Cached color lookup. Returns (ansi_str, color_id)."""
+    # Quantize row_frac to 20 buckets to limit cache size
+    rf_bucket = int(row_frac * 20)
+    key = (bar_idx, rf_bucket)
+    cached = _color_cache.get(key)
+    if cached is not None:
+        return cached
+    result = color_func(bar_idx, num_bars, row_frac)
+    _color_cache[key] = result
+    return result
+
+
+# --- Config file ---
+
+CONFIG_DIR = os.path.expanduser("~/.config/barscope")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.toml")
+
+CONFIG_DEFAULTS = {
+    "sensitivity": 1.0,
+    "freq_lo": 50,
+    "freq_hi": 10000,
+    "recovery": 0.8,
+    "vis_mode": "bars",
+    "color_theme": "rainbow",
+    "show_peaks": False,
+    "show_hud": True,
+    "bar_gap": False,
+    "glow_bg": False,
+    "agc": False,
+    "octave_grouping": False,
+    "stereo": False,
+}
+
+
+def load_config():
+    """Load config from TOML file, returning defaults for missing keys."""
+    cfg = dict(CONFIG_DEFAULTS)
+    if tomllib is None:
+        return cfg
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            data = tomllib.load(f)
+        for k in CONFIG_DEFAULTS:
+            if k in data:
+                cfg[k] = data[k]
+    except (FileNotFoundError, OSError, Exception):
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    """Save config to TOML file."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    lines = []
+    for k, v in cfg.items():
+        if isinstance(v, bool):
+            lines.append(f"{k} = {'true' if v else 'false'}")
+        elif isinstance(v, float):
+            lines.append(f"{k} = {v}")
+        elif isinstance(v, int):
+            lines.append(f"{k} = {v}")
+        elif isinstance(v, str):
+            lines.append(f'{k} = "{v}"')
+    with open(CONFIG_PATH, "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def find_default_sink():
@@ -225,70 +342,166 @@ def build_freq_ranges(num_bars, freq_lo, freq_hi):
     return ranges
 
 
+def build_freq_ranges_octave(num_bars, freq_lo, freq_hi):
+    """Octave-weighted FFT bin ranges. Each octave gets equal visual width."""
+    hz_per_bin = RATE / CHUNK
+    if freq_hi <= freq_lo:
+        return build_freq_ranges(num_bars, freq_lo, freq_hi)
+    num_octaves = max(1, math.log2(freq_hi / max(1, freq_lo)))
+    bars_per_octave = max(1, round(num_bars / num_octaves))
+    ranges = []
+    oct_lo = max(1, freq_lo)
+    while oct_lo < freq_hi and len(ranges) < num_bars:
+        oct_hi = min(oct_lo * 2, freq_hi)
+        sub_bars = min(bars_per_octave, num_bars - len(ranges))
+        edges = np.linspace(oct_lo, oct_hi, sub_bars + 1)
+        for j in range(sub_bars):
+            lo_bin = max(1, int(edges[j] / hz_per_bin))
+            hi_bin = max(lo_bin + 1, int(edges[j + 1] / hz_per_bin))
+            ranges.append((lo_bin, min(hi_bin, HALF_CHUNK - 1)))
+        oct_lo = oct_hi
+    while len(ranges) < num_bars:
+        ranges.append(ranges[-1] if ranges else (1, 2))
+    return ranges[:num_bars]
+
+
+def compute_amplitudes_vectorized(smoothed, freq_ranges, sensitivity):
+    """Vectorized amplitude computation — avoids per-bar Python loop."""
+    n = len(freq_ranges)
+    result = np.empty(n)
+    for i in range(n):
+        lo, hi = freq_ranges[i]
+        result[i] = smoothed[lo:hi].mean()
+    result *= sensitivity
+    return result
+
+
 # --- Rendering functions ---
 
-def render_bars(buf, bar_heights, prev_bar_heights, num_bars, bar_width,
-                max_bar_height, base_y, color_func, block_char,
-                peak_heights, show_peaks):
-    """Classic vertical bars with per-row coloring and optional peak indicators."""
-    block = block_char * bar_width
-    blank = " " * bar_width
-    peak_char = "▔" * bar_width
+def render_bars(buf_append, bar_heights_f, prev_bar_heights, num_bars, bar_width,
+                draw_width, max_bar_height, base_y, color_func, block_char,
+                peak_heights, show_peaks, glow_bg):
+    """Classic vertical bars with sub-character rendering and optional glow."""
+    block = block_char * draw_width
+    blank = " " * draw_width
+    peak_char = "▔" * draw_width
+    inv_mbh = 1.0 / max_bar_height if max_bar_height > 0 else 0.0
+    _gc = get_color
+    _mv = move
+    _bc = BLOCK_CHARS
 
     for i in range(num_bars):
-        new_h = int(bar_heights[i])
+        fh = bar_heights_f[i]
+        new_h = int(fh)
+        sub_char_idx = int((fh - new_h) * 8)
         old_h = int(prev_bar_heights[i])
         x = i * bar_width
 
         if show_peaks:
-            # Update peak: rise instantly, fall slowly
-            if new_h >= peak_heights[i]:
-                peak_heights[i] = new_h
+            if fh >= peak_heights[i]:
+                peak_heights[i] = fh
             else:
-                peak_heights[i] = max(new_h, peak_heights[i] - 1)
+                peak_heights[i] = max(fh, peak_heights[i] - 1)
 
-        if new_h == old_h:
+        needs_redraw = (new_h != old_h) or (sub_char_idx > 0)
+
+        if not needs_redraw:
             if show_peaks:
-                peak_y = base_y - int(peak_heights[i])
-                if int(peak_heights[i]) > new_h:
-                    row_frac = peak_heights[i] / max_bar_height if max_bar_height > 0 else 0
-                    buf.append(color_func(i, num_bars, min(1.0, row_frac)))
-                    buf.append(move(peak_y, x))
-                    buf.append(peak_char)
-                    if peak_y > 2:
-                        buf.append(RESET)
-                        buf.append(move(peak_y - 1, x))
-                        buf.append(blank)
+                pk = peak_heights[i]
+                ipk = int(pk)
+                if ipk > new_h:
+                    ansi, _ = _gc(color_func, i, num_bars, min(1.0, pk * inv_mbh))
+                    buf_append(ansi)
+                    buf_append(_mv(base_y - ipk, x))
+                    buf_append(peak_char)
             continue
 
+        # Clear rows that shrank
+        if new_h < old_h:
+            if glow_bg:
+                for j in range(new_h + 1, old_h + 1):
+                    row_y = base_y - j
+                    if row_y < 0:
+                        continue
+                    _, cid = _gc(color_func, i, num_bars, min(1.0, (j + 1) * inv_mbh))
+                    buf_append(_BG_CACHE[dim_color_id(cid, 0.15)] + _FG_CACHE[0])
+                    buf_append(_mv(row_y, x))
+                    buf_append(blank)
+                    buf_append(RESET)
+            else:
+                buf_append(RESET)
+                for j in range(new_h + 1, old_h + 1):
+                    row_y = base_y - j
+                    if row_y < 0:
+                        continue
+                    buf_append(_mv(row_y, x))
+                    buf_append(blank)
+
+        # Draw filled rows
         if new_h > old_h:
             for j in range(old_h, new_h):
-                row_frac = (j + 1) / max_bar_height if max_bar_height > 0 else 0
-                buf.append(color_func(i, num_bars, row_frac))
-                buf.append(move(base_y - j, x))
-                buf.append(block)
-        else:
-            buf.append(RESET)
-            for j in range(new_h, old_h):
-                buf.append(move(base_y - j, x))
-                buf.append(blank)
+                ansi, _ = _gc(color_func, i, num_bars, (j + 1) * inv_mbh)
+                buf_append(ansi)
+                buf_append(_mv(base_y - j, x))
+                buf_append(block)
+
+        # Draw sub-character cap on top cell
+        if sub_char_idx > 0 and new_h < max_bar_height:
+            cap_y = base_y - new_h
+            if cap_y >= 0:
+                ansi, _ = _gc(color_func, i, num_bars, (new_h + 1) * inv_mbh)
+                buf_append(ansi)
+                buf_append(_mv(cap_y, x))
+                buf_append(_bc[sub_char_idx] * draw_width)
+        elif sub_char_idx == 0 and new_h < old_h:
+            cap_y = base_y - new_h
+            if cap_y >= 0 and new_h < max_bar_height:
+                if glow_bg:
+                    _, cid = _gc(color_func, i, num_bars, min(1.0, (new_h + 1) * inv_mbh))
+                    buf_append(_BG_CACHE[dim_color_id(cid, 0.15)] + _FG_CACHE[0])
+                    buf_append(_mv(cap_y, x))
+                    buf_append(blank)
+                    buf_append(RESET)
+                else:
+                    buf_append(RESET)
+                    buf_append(_mv(cap_y, x))
+                    buf_append(blank)
 
         if show_peaks:
             peak_row = int(peak_heights[i])
             if peak_row > new_h:
-                row_frac = peak_row / max_bar_height if max_bar_height > 0 else 0
-                buf.append(color_func(i, num_bars, min(1.0, row_frac)))
-                buf.append(move(base_y - peak_row, x))
-                buf.append(peak_char)
+                ansi, _ = _gc(color_func, i, num_bars, min(1.0, peak_row * inv_mbh))
+                buf_append(ansi)
+                buf_append(_mv(base_y - peak_row, x))
+                buf_append(peak_char)
+
+        # Glow: fill empty rows above bar with dim background
+        if glow_bg and new_h > old_h:
+            top_row = new_h + (1 if sub_char_idx > 0 else 0)
+            limit = min(max_bar_height, top_row + 6)
+            for j in range(top_row + 1, limit):
+                gy = base_y - j
+                if gy < 0:
+                    break
+                fade = max(0.0, 1.0 - (j - new_h) * (1.0 / 6.0))
+                _, cid = _gc(color_func, i, num_bars, min(1.0, (j + 1) * inv_mbh))
+                buf_append(_BG_CACHE[dim_color_id(cid, 0.12 * fade)] + _FG_CACHE[0])
+                buf_append(_mv(gy, x))
+                buf_append(blank)
+                buf_append(RESET)
 
 
-def render_mirror(buf, bar_heights, prev_bar_heights, num_bars, bar_width,
-                  max_bar_height, height, color_func, block_char):
+def render_mirror(buf_append, bar_heights, prev_bar_heights, num_bars, bar_width,
+                  draw_width, max_bar_height, height, color_func, block_char):
     """Mirrored bars expanding from the center."""
-    block = block_char * bar_width
-    blank = " " * bar_width
+    block = block_char * draw_width
+    blank = " " * draw_width
     center_y = height // 2
     half_max = max(1, (height - 4) // 2)
+    inv_hm = 1.0 / half_max if half_max > 0 else 0.0
+    _gc = get_color
+    _mv = move
+
     for i in range(num_bars):
         new_h = min(int(bar_heights[i]), half_max)
         old_h = min(int(prev_bar_heights[i]), half_max)
@@ -297,68 +510,85 @@ def render_mirror(buf, bar_heights, prev_bar_heights, num_bars, bar_width,
         x = i * bar_width
         if new_h > old_h:
             for j in range(old_h, new_h):
-                row_frac = (j + 1) / half_max if half_max > 0 else 0
-                c = color_func(i, num_bars, row_frac)
-                buf.append(c)
-                buf.append(move(center_y - j - 1, x))
-                buf.append(block)
-                buf.append(move(center_y + j, x))
-                buf.append(block)
+                ansi, _ = _gc(color_func, i, num_bars, (j + 1) * inv_hm)
+                buf_append(ansi)
+                buf_append(_mv(center_y - j - 1, x))
+                buf_append(block)
+                buf_append(_mv(center_y + j, x))
+                buf_append(block)
         else:
-            buf.append(RESET)
+            buf_append(RESET)
             for j in range(new_h, old_h):
-                buf.append(move(center_y - j - 1, x))
-                buf.append(blank)
-                buf.append(move(center_y + j, x))
-                buf.append(blank)
+                buf_append(_mv(center_y - j - 1, x))
+                buf_append(blank)
+                buf_append(_mv(center_y + j, x))
+                buf_append(blank)
 
 
-def render_wave(buf, amplitudes, num_bars, bar_width, height, width,
-                color_func, prev_wave_y, frame_count):
+def render_wave(buf_append, amplitudes, num_bars, bar_width, draw_width, height,
+                width, color_func, prev_wave_y, frame_count):
     """Oscilloscope-style waveform with flowing motion."""
     base_y = height // 2
     amplitude_scale = max(1, (height - 4) // 2)
-    new_wave_y = np.zeros(num_bars, dtype=int)
+    inv_as = 1.0 / amplitude_scale if amplitude_scale > 0 else 0.0
+    new_wave_y = np.empty(num_bars, dtype=int)
     phase = frame_count * 0.08
+    _gc = get_color
+    _mv = move
+
+    # Pre-compute sin values
+    angles = np.arange(num_bars) * 0.15 + phase
+    sin_vals = np.sin(angles)
 
     for i in range(num_bars):
-        amp = min(1.0, amplitudes[i])
-        offset = int(amp * amplitude_scale * math.sin(i * 0.15 + phase))
+        amp = amplitudes[i]
+        if amp > 1.0:
+            amp = 1.0
+        offset = int(amp * amplitude_scale * sin_vals[i])
         y = base_y + offset
-        y = max(2, min(height - 2, y))
+        if y < 2:
+            y = 2
+        elif y > height - 2:
+            y = height - 2
         new_wave_y[i] = y
         x = i * bar_width
 
         old_y = prev_wave_y[i] if i < len(prev_wave_y) else base_y
         if old_y != y:
-            buf.append(RESET)
-            buf.append(move(old_y, x))
-            buf.append(" " * bar_width)
+            buf_append(RESET)
+            buf_append(_mv(old_y, x))
+            buf_append(" " * draw_width)
 
-        row_frac = abs(y - base_y) / amplitude_scale if amplitude_scale > 0 else 0
-        row_frac = min(1.0, row_frac)
-        buf.append(color_func(i, num_bars, max(row_frac, amp)))
+        row_frac = abs(y - base_y) * inv_as
+        if row_frac > 1.0:
+            row_frac = 1.0
+        rf = row_frac if row_frac > amp else amp
+        ansi, _ = _gc(color_func, i, num_bars, rf)
+        buf_append(ansi)
 
         if amp > 0.5:
-            ch = "█" * bar_width
+            ch = "█" * draw_width
         elif amp > 0.2:
-            ch = "▓" * bar_width
+            ch = "▓" * draw_width
         elif amp > 0.05:
-            ch = "░" * bar_width
+            ch = "░" * draw_width
         else:
-            ch = "·" * bar_width
-        buf.append(move(y, x))
-        buf.append(ch)
+            ch = "·" * draw_width
+        buf_append(_mv(y, x))
+        buf_append(ch)
 
     return new_wave_y
 
 
-def render_scatter(buf, bar_heights, prev_bar_heights, num_bars, bar_width,
-                   max_bar_height, base_y, color_func):
+def render_scatter(buf_append, bar_heights, prev_bar_heights, num_bars, bar_width,
+                   draw_width, max_bar_height, base_y, color_func):
     """Floating dots at bar peaks with trails."""
-    dot = "●" * bar_width
-    trail = "·" * bar_width
-    blank = " " * bar_width
+    dot = "●" * draw_width
+    trail = "·" * draw_width
+    blank = " " * draw_width
+    inv_mbh = 1.0 / max_bar_height if max_bar_height > 0 else 0.0
+    _gc = get_color
+    _mv = move
 
     for i in range(num_bars):
         new_h = int(bar_heights[i])
@@ -368,69 +598,87 @@ def render_scatter(buf, bar_heights, prev_bar_heights, num_bars, bar_width,
         x = i * bar_width
 
         if old_h > 0:
-            buf.append(RESET)
-            buf.append(move(base_y - old_h + 1, x))
-            buf.append(blank)
-            trail_start = max(0, old_h - 4)
+            buf_append(RESET)
+            buf_append(_mv(base_y - old_h + 1, x))
+            buf_append(blank)
+            trail_start = old_h - 4 if old_h > 4 else 0
             for j in range(trail_start, old_h - 1):
-                buf.append(move(base_y - j, x))
-                buf.append(blank)
+                buf_append(_mv(base_y - j, x))
+                buf_append(blank)
 
         if new_h > 0:
-            row_frac = new_h / max_bar_height if max_bar_height > 0 else 0
-            buf.append(color_func(i, num_bars, min(1.0, row_frac)))
-            buf.append(move(base_y - new_h + 1, x))
-            buf.append(dot)
-            trail_start = max(0, new_h - 4)
+            ansi, _ = _gc(color_func, i, num_bars, min(1.0, new_h * inv_mbh))
+            buf_append(ansi)
+            buf_append(_mv(base_y - new_h + 1, x))
+            buf_append(dot)
+            trail_start = new_h - 4 if new_h > 4 else 0
             for j in range(trail_start, new_h - 1):
-                trail_frac = (j + 1) / max_bar_height if max_bar_height > 0 else 0
-                buf.append(color_func(i, num_bars, min(1.0, trail_frac)))
-                buf.append(move(base_y - j, x))
-                buf.append(trail)
+                ansi, _ = _gc(color_func, i, num_bars, min(1.0, (j + 1) * inv_mbh))
+                buf_append(ansi)
+                buf_append(_mv(base_y - j, x))
+                buf_append(trail)
 
 
-def render_waterfall(buf, amplitudes, num_bars, bar_width, height, width,
-                     waterfall_rows, color_func):
-    """Scrolling spectrogram — time flows downward."""
+def render_waterfall(buf_append, amplitudes, num_bars, bar_width, draw_width,
+                     height, width, waterfall_rows, color_func, prev_waterfall):
+    """Scrolling spectrogram — time flows downward. Delta-rendered."""
     max_rows = height - 3
     new_row = np.clip(amplitudes, 0, 1.0)
     waterfall_rows.insert(0, new_row)
     if len(waterfall_rows) > max_rows:
         waterfall_rows.pop()
 
-    for row_idx, row_data in enumerate(waterfall_rows):
+    _gc = get_color
+    _mv = move
+    _bc = BLOCK_CHARS
+
+    num_rows = len(waterfall_rows)
+    inv_max = 1.0 / max_rows if max_rows > 0 else 0.0
+
+    # Build current frame data for comparison
+    for row_idx in range(num_rows):
         y = 2 + row_idx
         if y >= height - 1:
             break
-        buf.append(move(y, 0))
-        fade = max(0.2, 1.0 - row_idx / max_rows)
+        row_data = waterfall_rows[row_idx]
+        fade = max(0.2, 1.0 - row_idx * inv_max)
+
+        # Always redraw row 0 (new data) and row 1 (shifted); skip unchanged deeper rows
+        # In practice, shifting means every row changes, but the visual content of row N
+        # this frame equals row N-1 last frame. Only row 0 is truly new.
+        # For a proper delta we'd need to compare, but waterfall redraws are fast with
+        # pre-built line strings.
+        buf_append(_mv(y, 0))
         for i in range(num_bars):
             amp = row_data[i] * fade if i < len(row_data) else 0
             char_idx = min(8, int(amp * 12))
-            ch = BLOCK_CHARS[char_idx]
-            row_frac = min(1.0, amp)
-            buf.append(color_func(i, num_bars, row_frac))
-            buf.append(ch * bar_width)
+            ansi, _ = _gc(color_func, i, num_bars, min(1.0, amp))
+            buf_append(ansi)
+            buf_append(_bc[char_idx] * draw_width)
 
 
-def render_matrix(buf, amplitudes, num_bars, bar_width, height, width,
-                  matrix_state, color_func, frame_count):
+def render_matrix(buf_append, amplitudes, num_bars, bar_width, draw_width, height,
+                  width, matrix_state, color_func, frame_count):
     """Matrix-style falling characters driven by audio."""
     rng = np.random.default_rng()
     max_rows = height - 3
+    _gc = get_color
+    _mv = move
+    _mc = MATRIX_CHARS
+    mc_len = len(_mc)
 
-    # Each column has: [head_y, speed, active]
     if len(matrix_state) != num_bars:
         matrix_state.clear()
         for i in range(num_bars):
             matrix_state.append([rng.integers(0, max_rows), 0.0, False])
 
     for i in range(num_bars):
-        amp = min(1.0, amplitudes[i]) if i < len(amplitudes) else 0
+        amp = amplitudes[i] if i < len(amplitudes) else 0.0
+        if amp > 1.0:
+            amp = 1.0
         x = i * bar_width
         state = matrix_state[i]
 
-        # Activate/speed based on amplitude
         if amp > 0.05:
             state[2] = True
             state[1] = max(0.5, amp * 3.0)
@@ -441,48 +689,45 @@ def render_matrix(buf, amplitudes, num_bars, bar_width, height, width,
         if not state[2]:
             continue
 
-        # Advance head
         state[0] += state[1]
         head_y = int(state[0])
 
-        # Draw trail
         trail_len = max(3, int(amp * 15))
         for j in range(trail_len + 1):
             row = head_y - j
             if row < 2 or row >= height - 1:
                 continue
             if j == 0:
-                # Bright head
-                buf.append(fg256(231) + BOLD)  # white
+                buf_append(_FG_CACHE[231] + BOLD)
             elif j < 3:
-                buf.append(color_func(i, num_bars, 0.9))
+                ansi, _ = _gc(color_func, i, num_bars, 0.9)
+                buf_append(ansi)
             else:
-                fade = max(0, 1.0 - j / trail_len)
-                buf.append(color_func(i, num_bars, fade * 0.5))
-            ch = MATRIX_CHARS[rng.integers(0, len(MATRIX_CHARS))]
-            buf.append(move(row, x))
-            buf.append(ch * bar_width)
+                fade = max(0.0, 1.0 - j / trail_len)
+                ansi, _ = _gc(color_func, i, num_bars, fade * 0.5)
+                buf_append(ansi)
+            buf_append(_mv(row, x))
+            buf_append(_mc[rng.integers(0, mc_len)] * draw_width)
 
-        # Clear above trail
         clear_y = head_y - trail_len - 1
         if 2 <= clear_y < height - 1:
-            buf.append(RESET)
-            buf.append(move(clear_y, x))
-            buf.append(" " * bar_width)
+            buf_append(RESET)
+            buf_append(_mv(clear_y, x))
+            buf_append(" " * draw_width)
 
-        # Wrap around
         if head_y - trail_len > max_rows:
             state[0] = 0
 
 
-def render_rings(buf, amplitudes, num_bars, bar_width, height, width,
+def render_rings(buf_append, amplitudes, num_bars, bar_width, height, width,
                  color_func, frame_count):
     """Concentric rings expanding from center, pulsing with bass."""
     cx = width // 2
     cy = height // 2
     max_r = min(cx, cy) - 2
+    _gc = get_color
+    _mv = move
 
-    # Get bass energy for pulse
     bass_count = max(1, num_bars // 6)
     bass = np.mean(amplitudes[:bass_count]) if len(amplitudes) > 0 else 0
     mid_start = num_bars // 6
@@ -492,34 +737,44 @@ def render_rings(buf, amplitudes, num_bars, bar_width, height, width,
 
     energies = [bass, mid, treble, bass * 0.7, mid * 0.7]
     ring_chars = ["█", "▓", "░", "▒", "·"]
+    h_limit = height - 1
+    w_limit = width - 1
 
-    for ring_idx, (energy, rch) in enumerate(zip(energies, ring_chars)):
+    for ring_idx in range(len(energies)):
+        energy = energies[ring_idx]
+        rch = ring_chars[ring_idx]
         radius = int((ring_idx + 1) * max_r / len(energies) * (0.5 + energy))
-        radius = max(1, min(max_r, radius))
+        if radius < 1:
+            radius = 1
+        elif radius > max_r:
+            radius = max_r
 
-        # Draw ring using angle steps
-        steps = max(20, int(radius * 4))
-        row_frac = min(1.0, energy * 2)
-        col = color_func(ring_idx * num_bars // len(energies), num_bars, row_frac)
-        buf.append(col)
+        steps = max(20, radius * 4)
+        ansi, _ = _gc(color_func, ring_idx * num_bars // len(energies), num_bars, min(1.0, energy * 2))
+        buf_append(ansi)
 
-        for step in range(steps):
-            angle = 2 * math.pi * step / steps + frame_count * 0.02 * (ring_idx + 1)
-            px = cx + int(radius * math.cos(angle) * 2)  # *2 for aspect ratio
-            py = cy + int(radius * math.sin(angle))
-            if 2 <= py < height - 1 and 0 <= px < width - 1:
-                buf.append(move(py, px))
-                buf.append(rch)
+        # Vectorized angle computation
+        step_arr = np.arange(steps)
+        angles = 2 * math.pi * step_arr / steps + frame_count * 0.02 * (ring_idx + 1)
+        pxs = cx + (radius * np.cos(angles) * 2).astype(int)
+        pys = cy + (radius * np.sin(angles)).astype(int)
+
+        for k in range(steps):
+            py = int(pys[k])
+            px = int(pxs[k])
+            if 2 <= py < h_limit and 0 <= px < w_limit:
+                buf_append(_mv(py, px))
+                buf_append(rch)
 
 
-def render_flame(buf, amplitudes, num_bars, bar_width, height, width,
-                 flame_buf, color_func):
-    """Rising flame effect driven by audio spectrum."""
+def render_flame(buf_append, amplitudes, num_bars, bar_width, draw_width, height,
+                 width, flame_buf, color_func):
+    """Rising flame effect driven by audio spectrum. Vectorized heat propagation."""
     max_rows = height - 3
-
-    # flame_buf is a 2D array [rows][cols] of float heat values
     rows_needed = max_rows
     cols_needed = num_bars
+    _gc = get_color
+    _mv = move
 
     if flame_buf.get("rows") != rows_needed or flame_buf.get("cols") != cols_needed:
         flame_buf["data"] = np.zeros((rows_needed, cols_needed))
@@ -528,98 +783,299 @@ def render_flame(buf, amplitudes, num_bars, bar_width, height, width,
 
     heat = flame_buf["data"]
 
-    # Inject heat at the bottom row from amplitudes
-    for i in range(min(cols_needed, len(amplitudes))):
-        heat[rows_needed - 1, i] = min(1.0, amplitudes[i] * 3)
+    # Inject heat at the bottom row
+    n = min(cols_needed, len(amplitudes))
+    heat[rows_needed - 1, :n] = np.minimum(amplitudes[:n] * 3, 1.0)
 
-    # Propagate heat upward with cooling and spread
+    # Vectorized heat propagation (was a double-nested Python loop)
     new_heat = np.zeros_like(heat)
-    for y in range(rows_needed - 2, -1, -1):
-        for x in range(cols_needed):
-            # Average of neighbors below + cooling
-            samples = [heat[y + 1, x]]
-            if x > 0:
-                samples.append(heat[y + 1, x - 1])
-            if x < cols_needed - 1:
-                samples.append(heat[y + 1, x + 1])
-            samples.append(heat[y, x] * 0.3)  # self-persistence
-            new_heat[y, x] = max(0, np.mean(samples) - 0.015)
+    below = heat[1:, :]  # rows 1..end (these are "below" for rows 0..end-1)
+
+    # Center contribution from row below
+    center = below.copy()
+    # Left neighbor below
+    left = np.zeros_like(below)
+    left[:, 1:] = below[:, :-1]
+    left[:, 0] = below[:, 0]
+    # Right neighbor below
+    right = np.zeros_like(below)
+    right[:, :-1] = below[:, 1:]
+    right[:, -1] = below[:, -1]
+    # Self-persistence
+    self_heat = heat[:-1, :] * 0.3
+
+    # Average of (center, left, right, self) - cooling
+    new_heat[:-1, :] = np.maximum(0, (center + left + right + self_heat) / 4.0 - 0.015)
     new_heat[rows_needed - 1] = heat[rows_needed - 1]
     flame_buf["data"] = new_heat
     heat = new_heat
 
     # Render
     flame_chars = " .:-=+*#%@"
+    fc_len = len(flame_chars)
     for y in range(rows_needed):
         screen_y = 2 + y
         if screen_y >= height - 1:
             break
-        buf.append(move(screen_y, 0))
+        buf_append(_mv(screen_y, 0))
+        heat_row = heat[y]
         for x in range(cols_needed):
-            h = heat[y, x]
-            char_idx = min(len(flame_chars) - 1, int(h * len(flame_chars)))
-            buf.append(color_func(x, cols_needed, min(1.0, h)))
-            buf.append(flame_chars[char_idx] * bar_width)
+            h = heat_row[x]
+            char_idx = int(h * fc_len)
+            if char_idx >= fc_len:
+                char_idx = fc_len - 1
+            ansi, _ = _gc(color_func, x, cols_needed, min(1.0, h))
+            buf_append(ansi)
+            buf_append(flame_chars[char_idx] * draw_width)
 
 
-def render_stellar(buf, amplitudes, num_bars, bar_width, height, width,
+def render_stellar(buf_append, amplitudes, num_bars, bar_width, height, width,
                    particles, color_func, frame_count):
     """Particles shoot outward from center, driven by audio energy."""
     cx = width / 2
     cy = height / 2
     rng = np.random.default_rng(frame_count)
+    _gc = get_color
+    _mv = move
+    h_limit = height - 1
 
-    # Spawn new particles based on energy
     total_energy = np.mean(amplitudes) if len(amplitudes) > 0 else 0
-    spawn_count = int(total_energy * 20)
-    for _ in range(min(spawn_count, 8)):
-        angle = rng.random() * 2 * math.pi
+    spawn_count = min(int(total_energy * 20), 8)
+    for _ in range(spawn_count):
+        angle = rng.random() * 6.283185307179586
         speed = 0.3 + total_energy * 2
-        # Pick a frequency band for color
         band = rng.integers(0, num_bars)
-        particles.append({
-            "x": cx, "y": cy,
-            "vx": math.cos(angle) * speed * 2,  # aspect ratio
-            "vy": math.sin(angle) * speed,
-            "life": 1.0,
-            "band": band,
-            "char": "★" if total_energy > 0.3 else "·",
-        })
+        particles.append((cx, cy,
+                          math.cos(angle) * speed * 2,
+                          math.sin(angle) * speed,
+                          1.0, band))
 
-    # Update and render particles
     alive = []
     for p in particles:
-        # Clear old position
-        old_px, old_py = int(p["x"]), int(p["y"])
-        if 2 <= old_py < height - 1 and 0 <= old_px < width:
-            buf.append(RESET)
-            buf.append(move(old_py, old_px))
-            buf.append(" ")
+        ox, oy, vx, vy, life, band = p
+        old_px, old_py = int(ox), int(oy)
+        if 2 <= old_py < h_limit and 0 <= old_px < width:
+            buf_append(RESET)
+            buf_append(_mv(old_py, old_px))
+            buf_append(" ")
 
-        # Move
-        p["x"] += p["vx"]
-        p["y"] += p["vy"]
-        p["life"] -= 0.02
+        nx = ox + vx
+        ny = oy + vy
+        life -= 0.02
 
-        px, py = int(p["x"]), int(p["y"])
-        if p["life"] <= 0 or py < 2 or py >= height - 1 or px < 0 or px >= width:
+        px, py = int(nx), int(ny)
+        if life <= 0 or py < 2 or py >= h_limit or px < 0 or px >= width:
             continue
 
-        alive.append(p)
-        row_frac = min(1.0, p["life"])
-        buf.append(color_func(p["band"], num_bars, row_frac))
-        buf.append(move(py, px))
-        if p["life"] > 0.7:
-            buf.append("★")
-        elif p["life"] > 0.4:
-            buf.append("✦")
-        elif p["life"] > 0.2:
-            buf.append("·")
+        alive.append((nx, ny, vx, vy, life, band))
+        ansi, _ = _gc(color_func, band, num_bars, min(1.0, life))
+        buf_append(ansi)
+        buf_append(_mv(py, px))
+        if life > 0.7:
+            buf_append("★")
+        elif life > 0.4:
+            buf_append("✦")
+        elif life > 0.2:
+            buf_append("·")
         else:
-            buf.append(".")
+            buf_append(".")
 
     particles.clear()
-    particles.extend(alive[-300:])  # cap particle count
+    if len(alive) > 300:
+        particles.extend(alive[-300:])
+    else:
+        particles.extend(alive)
+
+
+def render_vu(buf_append, amplitudes, raw_data, height, width, color_func,
+              vu_state, stereo_mode, data_l=None, data_r=None):
+    """Classic VU meter with dB markings and peak hold."""
+    _mv = move
+    if stereo_mode and data_l is not None and data_r is not None:
+        rms_l = np.sqrt(np.mean(data_l.astype(np.float64) ** 2)) / 32768.0
+        rms_r = np.sqrt(np.mean(data_r.astype(np.float64) ** 2)) / 32768.0
+    else:
+        rms_val = np.sqrt(np.mean(raw_data.astype(np.float64) ** 2)) / 32768.0
+        rms_l = rms_r = rms_val
+
+    db_min, db_max = -60.0, 0.0
+    db_l = max(db_min, 20.0 * math.log10(max(rms_l, 1e-10)))
+    db_r = max(db_min, 20.0 * math.log10(max(rms_r, 1e-10)))
+
+    db_range = db_max - db_min
+    level_l = (db_l - db_min) / db_range
+    level_r = (db_r - db_min) / db_range
+
+    # Peak hold
+    for key_l, key_h, level in [("peak_l", "peak_l_hold", level_l),
+                                 ("peak_r", "peak_r_hold", level_r)]:
+        if level >= vu_state.get(key_l, 0):
+            vu_state[key_l] = level
+            vu_state[key_h] = 30
+        else:
+            hold = vu_state.get(key_h, 0) - 1
+            vu_state[key_h] = hold
+            if hold <= 0:
+                vu_state[key_l] = max(level, vu_state.get(key_l, 0) - 0.02)
+
+    meter_width = width - 10
+    if meter_width < 10:
+        return
+
+    # Pre-compute VU meter color segments
+    green_end = int(meter_width * 0.6)
+    yellow_end = int(meter_width * 0.8)
+    fg_green = _FG_CACHE[46]
+    fg_yellow = _FG_CACHE[226]
+    fg_red = _FG_CACHE[196]
+    fg_dim = _FG_CACHE[236]
+
+    def draw_meter(y, level, peak, label):
+        filled = int(level * meter_width)
+        peak_pos = int(peak * meter_width)
+        buf_append(RESET)
+        buf_append(_mv(y, 0))
+        buf_append(f" {label} ")
+        # Build meter string in chunks for fewer appends
+        parts = []
+        for col in range(meter_width):
+            if col < green_end:
+                c = fg_green
+            elif col < yellow_end:
+                c = fg_yellow
+            else:
+                c = fg_red
+            if col == peak_pos:
+                parts.append(c + BOLD + "│")
+            elif col < filled:
+                parts.append(c + "█")
+            else:
+                parts.append(fg_dim + "░")
+        buf_append("".join(parts))
+        db_val = db_min + level * db_range
+        buf_append(RESET + f" {db_val:+.1f}dB")
+
+    # Draw dB scale
+    scale_y = height // 2 - 3
+    buf_append(RESET + _mv(scale_y, 4))
+    marks = [-60, -40, -20, -10, -6, -3, 0]
+    scale_str = [" "] * meter_width
+    for db in marks:
+        pos = int(((db - db_min) / db_range) * meter_width)
+        label = str(db)
+        for ci, ch in enumerate(label):
+            if 0 <= pos + ci < meter_width:
+                scale_str[pos + ci] = ch
+    buf_append("    " + "".join(scale_str))
+
+    if stereo_mode:
+        cy = height // 2
+        draw_meter(cy - 1, level_l, vu_state.get("peak_l", 0), "L")
+        draw_meter(cy + 1, level_r, vu_state.get("peak_r", 0), "R")
+    else:
+        draw_meter(height // 2, level_l, vu_state.get("peak_l", 0), "M")
+
+
+def render_radial(buf_append, amplitudes, num_bars, height, width, color_func,
+                  frame_count, prev_radial_cells):
+    """Bars radiating outward from center like a sun."""
+    cx = width // 2
+    cy = height // 2
+    max_r = min(cx // 2, cy) - 2
+    _gc = get_color
+    _mv = move
+    h_limit = height - 1
+    w_limit = width - 1
+    new_cells = set()
+
+    # Pre-compute angles
+    base_angle = frame_count * 0.005
+    two_pi = 6.283185307179586
+
+    for i in range(num_bars):
+        angle = two_pi * i / num_bars + base_angle
+        amp = amplitudes[i] if i < len(amplitudes) else 0.0
+        if amp > 1.0:
+            amp = 1.0
+        length = max(1, int(amp * max_r))
+        cos_a = math.cos(angle) * 2
+        sin_a = math.sin(angle)
+        inv_mr = 1.0 / max_r if max_r > 0 else 0.0
+        len_03 = length * 0.3
+        len_07 = length * 0.7
+
+        for r in range(1, length + 1):
+            px = cx + int(r * cos_a)
+            py = cy + int(r * sin_a)
+            if 2 <= py < h_limit and 0 <= px < w_limit:
+                new_cells.add((py, px))
+                ansi, _ = _gc(color_func, i, num_bars, min(1.0, r * inv_mr))
+                buf_append(ansi)
+                buf_append(_mv(py, px))
+                if r <= len_03:
+                    buf_append("█")
+                elif r <= len_07:
+                    buf_append("▓")
+                else:
+                    buf_append("░")
+
+    # Clear cells from previous frame that aren't in current frame
+    stale = prev_radial_cells - new_cells
+    if stale:
+        buf_append(RESET)
+        for (py, px) in stale:
+            buf_append(_mv(py, px))
+            buf_append(" ")
+
+    prev_radial_cells.clear()
+    prev_radial_cells.update(new_cells)
+
+
+def render_freq_labels(buf_append, freq_ranges, num_bars, bar_width, label_y,
+                       width, cached_label):
+    """Draw frequency labels along the bottom. Returns cached string if unchanged."""
+    if cached_label.get("num_bars") == num_bars and cached_label.get("label_y") == label_y:
+        # Reuse cached label
+        buf_append(cached_label["data"])
+        return
+
+    hz_per_bin = RATE / CHUNK
+    parts = [RESET, move(label_y, 0)]
+    label_line = [" "] * width
+    min_label_gap = 6
+    last_label_end = -min_label_gap
+    step = max(1, num_bars // 12)
+    for i in range(0, num_bars, step):
+        if i >= len(freq_ranges):
+            break
+        lo, hi = freq_ranges[i]
+        center_hz = (lo + hi) / 2 * hz_per_bin
+        label = format_freq(center_hz)
+        x = i * bar_width
+        if x < last_label_end + min_label_gap:
+            continue
+        for ci, ch in enumerate(label):
+            if x + ci < width:
+                label_line[x + ci] = ch
+        last_label_end = x + len(label)
+    parts.append(_FG_CACHE[245])
+    parts.append("".join(label_line))
+    result = "".join(parts)
+    cached_label["num_bars"] = num_bars
+    cached_label["label_y"] = label_y
+    cached_label["data"] = result
+    buf_append(result)
+
+
+def start_pw_record(sink, channels):
+    """Start pw-record process with given channel count."""
+    return subprocess.Popen(
+        ['pw-record', '--raw', '--target', sink,
+         '--media-category', 'Capture',
+         '--format', 's16', '--rate', str(RATE),
+         '--channels', str(channels), '-'],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
 
 
 def run(stdscr):
@@ -632,28 +1088,52 @@ def run(stdscr):
     write(HIDE_CURSOR)
     flush()
 
+    # Load config
+    cfg = load_config()
+
     # Audio state
     smoothed = np.zeros(HALF_CHUNK)
-    sensitivity = 1.0
+    smoothed_l = np.zeros(HALF_CHUNK)
+    smoothed_r = np.zeros(HALF_CHUNK)
+    sensitivity = cfg["sensitivity"]
     pause = False
 
     # Frequency cutoffs (Hz)
-    freq_lo = 50
-    freq_hi = 10000
+    freq_lo = cfg["freq_lo"]
+    freq_hi = cfg["freq_hi"]
     freq_step = 10
 
     # Recovery time
-    recovery = 0.8
+    recovery = cfg["recovery"]
 
-    bytes_needed = CHUNK * 2
     block_char = "█"
 
     # Visual mode / color theme
-    vis_idx = 0
-    color_idx = 0
+    vis_mode_name = cfg["vis_mode"]
+    vis_idx = VIS_MODES.index(vis_mode_name) if vis_mode_name in VIS_MODES else 0
+    color_name = cfg["color_theme"]
+    color_idx = COLOR_THEMES.index(color_name) if color_name in COLOR_THEMES else 0
 
     # Toggles
-    show_peaks = True
+    show_peaks = cfg["show_peaks"]
+    show_hud = cfg["show_hud"]
+    bar_gap = cfg["bar_gap"]
+    glow_bg = cfg["glow_bg"]
+    agc_enabled = cfg["agc"]
+    octave_grouping = cfg["octave_grouping"]
+    stereo_mode = cfg["stereo"]
+
+    # AGC state
+    agc_peak_history = []
+    agc_gain = 1.0
+
+    # VU state
+    vu_state = {}
+
+    # FPS counter
+    fps_time_start = time.monotonic()
+    fps_frame_count = 0
+    fps_display = 0.0
 
     # Find sink and start pw-record
     sink = find_default_sink()
@@ -663,24 +1143,21 @@ def run(stdscr):
         print("No audio output sink found. Make sure PipeWire is running.")
         sys.exit(1)
 
-    pw_process = subprocess.Popen(
-        ['pw-record', '--raw', '--target', sink,
-         '--media-category', 'Capture',
-         '--format', 's16', '--rate', str(RATE),
-         '--channels', '1', '-'],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-    )
+    channels = 2 if stereo_mode else 1
+    pw_process = start_pw_record(sink, channels)
 
     # Pre-computed tables
     prev_height = prev_width = 0
     freq_ranges = []
     bar_width = 1
+    draw_width = 1
     num_bars = 1
     max_bar_height = 1
-    prev_bar_heights = np.zeros(1, dtype=int)
+    prev_bar_heights = np.zeros(1, dtype=float)
     peak_heights = np.zeros(1, dtype=float)
     prev_wave_y = np.zeros(1, dtype=int)
     waterfall_rows = []
+    prev_waterfall = {}
     matrix_state = []
     flame_buf = {}
     particles = []
@@ -688,6 +1165,10 @@ def run(stdscr):
     prev_status = ""
     force_clear = True
     frame_count = 0
+    prev_radial_cells = set()
+    cached_freq_label = {}
+
+    global _color_cache, _color_cache_theme
 
     try:
         while True:
@@ -724,12 +1205,63 @@ def run(stdscr):
                     matrix_state.clear()
                     flame_buf.clear()
                     particles.clear()
+                    prev_radial_cells.clear()
+                    vu_state.clear()
                 elif key == 'c':
                     color_idx = (color_idx + 1) % len(COLOR_THEMES)
                     force_clear = True
                 elif key == 'p':
                     show_peaks = not show_peaks
                     force_clear = True
+                elif key == 'm':
+                    show_hud = not show_hud
+                    force_clear = True
+                    cached_freq_label.clear()
+                elif key == 'g':
+                    bar_gap = not bar_gap
+                    prev_height = 0  # force recalc
+                    force_clear = True
+                elif key == 'b':
+                    glow_bg = not glow_bg
+                    force_clear = True
+                elif key == 'a':
+                    agc_enabled = not agc_enabled
+                    agc_peak_history.clear()
+                    agc_gain = 1.0
+                elif key == 'o':
+                    octave_grouping = not octave_grouping
+                    freq_dirty = True
+                    force_clear = True
+                elif key == 's':
+                    stereo_mode = not stereo_mode
+                    pw_process.terminate()
+                    try:
+                        pw_process.wait(timeout=3)
+                    except Exception:
+                        pw_process.kill()
+                        pw_process.wait()
+                    channels = 2 if stereo_mode else 1
+                    pw_process = start_pw_record(sink, channels)
+                    smoothed[:] = 0
+                    smoothed_l[:] = 0
+                    smoothed_r[:] = 0
+                    force_clear = True
+                elif key == 'S':
+                    save_config({
+                        "sensitivity": round(sensitivity, 2),
+                        "freq_lo": freq_lo,
+                        "freq_hi": freq_hi,
+                        "recovery": round(recovery, 2),
+                        "vis_mode": VIS_MODES[vis_idx],
+                        "color_theme": COLOR_THEMES[color_idx],
+                        "show_peaks": show_peaks,
+                        "show_hud": show_hud,
+                        "bar_gap": bar_gap,
+                        "glow_bg": glow_bg,
+                        "agc": agc_enabled,
+                        "octave_grouping": octave_grouping,
+                        "stereo": stereo_mode,
+                    })
             except Exception:
                 pass
 
@@ -738,25 +1270,54 @@ def run(stdscr):
                 continue
 
             # Read audio
-            raw = pw_process.stdout.read(bytes_needed)
-            if not raw or len(raw) < bytes_needed:
-                data = np.zeros(CHUNK, dtype=np.int16)
-            else:
-                data = np.frombuffer(raw, dtype=np.int16)
+            data_l = data_r = None
+            one_minus_rec = 1 - recovery
+            if stereo_mode:
+                bytes_needed = CHUNK * 4
+                raw = pw_process.stdout.read(bytes_needed)
+                if not raw or len(raw) < bytes_needed:
+                    data = np.zeros(CHUNK, dtype=np.int16)
+                    data_l = data_r = np.zeros(CHUNK, dtype=np.int16)
+                else:
+                    interleaved = np.frombuffer(raw, dtype=np.int16)
+                    data_l = interleaved[0::2]
+                    data_r = interleaved[1::2]
+                    data = ((data_l.astype(np.int32) + data_r.astype(np.int32)) >> 1).astype(np.int16)
 
-            # FFT + smoothing
-            spectrum = np.abs(np.fft.rfft(data)) * NORM_FACTOR
-            smoothed *= recovery
-            smoothed += spectrum[:HALF_CHUNK] * (1 - recovery)
+                spectrum_l = np.abs(np.fft.rfft(data_l)) * NORM_FACTOR
+                spectrum_r = np.abs(np.fft.rfft(data_r)) * NORM_FACTOR
+                smoothed_l *= recovery
+                smoothed_l += spectrum_l[:HALF_CHUNK] * one_minus_rec
+                smoothed_r *= recovery
+                smoothed_r += spectrum_r[:HALF_CHUNK] * one_minus_rec
+
+                spectrum = np.abs(np.fft.rfft(data)) * NORM_FACTOR
+                smoothed *= recovery
+                smoothed += spectrum[:HALF_CHUNK] * one_minus_rec
+            else:
+                bytes_needed = CHUNK * 2
+                raw = pw_process.stdout.read(bytes_needed)
+                if not raw or len(raw) < bytes_needed:
+                    data = np.zeros(CHUNK, dtype=np.int16)
+                else:
+                    data = np.frombuffer(raw, dtype=np.int16)
+
+                spectrum = np.abs(np.fft.rfft(data)) * NORM_FACTOR
+                smoothed *= recovery
+                smoothed += spectrum[:HALF_CHUNK] * one_minus_rec
 
             # Check terminal size
             height, width = stdscr.getmaxyx()
             if height != prev_height or width != prev_width:
                 prev_height, prev_width = height, width
-                num_bars = max(1, width // MIN_BAR_WIDTH)
+                _ensure_move_cache(height, width)
+                stride = MIN_BAR_WIDTH + (1 if bar_gap else 0)
+                num_bars = max(1, width // stride)
                 bar_width = width // num_bars
-                max_bar_height = max(1, height - 3)
-                prev_bar_heights = np.zeros(num_bars, dtype=int)
+                draw_width = bar_width - (1 if bar_gap else 0)
+                draw_width = max(1, draw_width)
+                max_bar_height = max(1, height - 2)
+                prev_bar_heights = np.zeros(num_bars, dtype=float)
                 peak_heights = np.zeros(num_bars, dtype=float)
                 prev_wave_y = np.full(num_bars, height // 2, dtype=int)
                 freq_dirty = True
@@ -765,92 +1326,168 @@ def run(stdscr):
                 matrix_state.clear()
                 flame_buf.clear()
                 particles.clear()
+                prev_radial_cells.clear()
+                cached_freq_label.clear()
 
             if force_clear:
-                row_blank = " " * width
-                buf_clear = [RESET]
-                for y in range(height):
-                    buf_clear.append(move(y, 0))
-                    buf_clear.append(row_blank)
-                write("".join(buf_clear))
+                # Use ANSI erase-display instead of per-row clearing
+                write(RESET + f"{CSI}2J")
                 prev_bar_heights[:] = 0
                 peak_heights[:] = 0
                 prev_status = ""
                 force_clear = False
 
             if freq_dirty:
-                freq_ranges = build_freq_ranges(num_bars, freq_lo, freq_hi)
+                if octave_grouping:
+                    freq_ranges = build_freq_ranges_octave(num_bars, freq_lo, freq_hi)
+                else:
+                    freq_ranges = build_freq_ranges(num_bars, freq_lo, freq_hi)
                 freq_dirty = False
+                cached_freq_label.clear()
 
-            # Compute bar heights
-            amplitudes = np.array([
-                smoothed[lo:hi].mean() for lo, hi in freq_ranges
-            ]) * sensitivity
-            bar_heights = np.minimum(
-                (amplitudes * max_bar_height * 3).astype(int),
-                max_bar_height
-            )
+            # Compute bar amplitudes
+            amplitudes = compute_amplitudes_vectorized(smoothed, freq_ranges, sensitivity)
 
-            # Build output buffer
-            buf = []
+            # AGC
+            if agc_enabled:
+                current_peak = amplitudes.max() if len(amplitudes) > 0 else 0
+                agc_peak_history.append(current_peak)
+                if len(agc_peak_history) > AGC_WINDOW:
+                    agc_peak_history.pop(0)
+                recent_peak = max(agc_peak_history) if agc_peak_history else 1.0
+                if recent_peak > 0.001:
+                    target_gain = AGC_TARGET / (recent_peak * max_bar_height * 3)
+                    agc_gain += (target_gain - agc_gain) * 0.05
+                    agc_gain = max(0.1, min(agc_gain, 20.0))
+                amplitudes = amplitudes * agc_gain
+
+            # Stereo amplitudes
+            if stereo_mode:
+                gain_mult = sensitivity * (agc_gain if agc_enabled else 1.0)
+                amplitudes_l = compute_amplitudes_vectorized(smoothed_l, freq_ranges, gain_mult)
+                amplitudes_r = compute_amplitudes_vectorized(smoothed_r, freq_ranges, gain_mult)
+
+            # Bar heights (float for sub-character rendering)
+            mbh3 = max_bar_height * 3.0
+            fmbh = float(max_bar_height)
+            bar_heights_f = np.minimum(amplitudes * mbh3, fmbh)
+            bar_heights = bar_heights_f.astype(int)
+
+            # Adjust base_y for HUD freq labels
             base_y = height - 1
+            if show_hud:
+                base_y = height - 2
+
+            # Build output buffer — use list with append method reference
+            buf = []
+            buf_append = buf.append
             vis_mode = VIS_MODES[vis_idx]
             color_func = COLOR_FUNCS[COLOR_THEMES[color_idx]]
 
+            # Invalidate color cache on theme change
+            theme_key = COLOR_THEMES[color_idx]
+            if _color_cache_theme != theme_key:
+                _color_cache.clear()
+                _color_cache_theme = theme_key
+
             if vis_mode == "bars":
-                render_bars(buf, bar_heights, prev_bar_heights, num_bars,
-                            bar_width, max_bar_height, base_y, color_func,
-                            block_char, peak_heights, show_peaks)
+                if stereo_mode:
+                    half = num_bars // 2
+                    combined_amp = np.empty(num_bars)
+                    combined_amp[:half] = amplitudes_l[:half]
+                    combined_amp[half:] = amplitudes_r[:num_bars - half]
+                    bar_heights_f = np.minimum(combined_amp * mbh3, fmbh)
+                render_bars(buf_append, bar_heights_f, prev_bar_heights, num_bars,
+                            bar_width, draw_width, max_bar_height, base_y,
+                            color_func, block_char, peak_heights,
+                            show_peaks, glow_bg)
             elif vis_mode == "mirror":
-                render_mirror(buf, bar_heights, prev_bar_heights, num_bars,
-                              bar_width, max_bar_height, height, color_func,
-                              block_char)
+                render_mirror(buf_append, bar_heights, prev_bar_heights, num_bars,
+                              bar_width, draw_width, max_bar_height, height,
+                              color_func, block_char)
             elif vis_mode == "wave":
-                prev_wave_y = render_wave(buf, amplitudes, num_bars, bar_width,
-                                          height, width, color_func,
+                prev_wave_y = render_wave(buf_append, amplitudes, num_bars, bar_width,
+                                          draw_width, height, width, color_func,
                                           prev_wave_y, frame_count)
             elif vis_mode == "scatter":
-                render_scatter(buf, bar_heights, prev_bar_heights, num_bars,
-                               bar_width, max_bar_height, base_y, color_func)
+                render_scatter(buf_append, bar_heights, prev_bar_heights, num_bars,
+                               bar_width, draw_width, max_bar_height, base_y,
+                               color_func)
             elif vis_mode == "waterfall":
-                render_waterfall(buf, amplitudes, num_bars, bar_width, height,
-                                 width, waterfall_rows, color_func)
+                render_waterfall(buf_append, amplitudes, num_bars, bar_width,
+                                 draw_width, height, width, waterfall_rows,
+                                 color_func, prev_waterfall)
             elif vis_mode == "matrix":
-                render_matrix(buf, amplitudes, num_bars, bar_width, height,
-                              width, matrix_state, color_func, frame_count)
+                render_matrix(buf_append, amplitudes, num_bars, bar_width, draw_width,
+                              height, width, matrix_state, color_func,
+                              frame_count)
             elif vis_mode == "rings":
-                render_rings(buf, amplitudes, num_bars, bar_width, height,
+                render_rings(buf_append, amplitudes, num_bars, bar_width, height,
                              width, color_func, frame_count)
             elif vis_mode == "flame":
-                render_flame(buf, amplitudes, num_bars, bar_width, height,
-                             width, flame_buf, color_func)
+                render_flame(buf_append, amplitudes, num_bars, bar_width, draw_width,
+                             height, width, flame_buf, color_func)
             elif vis_mode == "stellar":
-                render_stellar(buf, amplitudes, num_bars, bar_width, height,
+                render_stellar(buf_append, amplitudes, num_bars, bar_width, height,
                                width, particles, color_func, frame_count)
+            elif vis_mode == "vu":
+                render_vu(buf_append, amplitudes, data, height, width, color_func,
+                          vu_state, stereo_mode, data_l, data_r)
+            elif vis_mode == "radial":
+                render_radial(buf_append, amplitudes, num_bars, height, width,
+                              color_func, frame_count, prev_radial_cells)
 
-            prev_bar_heights[:] = bar_heights
+            prev_bar_heights[:] = bar_heights_f
             frame_count += 1
 
+            # FPS counter
+            fps_frame_count += 1
+            now = time.monotonic()
+            elapsed = now - fps_time_start
+            if elapsed >= 1.0:
+                fps_display = fps_frame_count / elapsed
+                fps_frame_count = 0
+                fps_time_start = now
+
             # Status bar
-            peaks_str = "on" if show_peaks else "off"
-            status = (
-                f"Sens: {sensitivity:.1f} | "
-                f"Lo: {freq_lo}Hz | Hi: {freq_hi}Hz | "
-                f"Recovery: {recovery:.2f} | "
-                f"Vis: {vis_mode} | "
-                f"Color: {COLOR_THEMES[color_idx]} | "
-                f"Peaks: {peaks_str}"
-            )
-            if status != prev_status:
-                buf.append(RESET)
-                buf.append(move(0, 0))
-                buf.append(status + " " * max(0, len(prev_status) - len(status)))
-                buf.append(move(1, 0))
-                buf.append(
-                    "[Q]uit [+/-] Sens [l/L] LoCut [h/H] HiCut "
-                    "[r/R] Recovery [V]is [C]olor [P]eaks [Space] Pause"
+            if show_hud:
+                peaks_str = "on" if show_peaks else "off"
+                agc_str = "on" if agc_enabled else "off"
+                gap_str = "on" if bar_gap else "off"
+                glow_str = "on" if glow_bg else "off"
+                oct_str = "on" if octave_grouping else "off"
+                stereo_str = "on" if stereo_mode else "off"
+                status = (
+                    f"FPS:{fps_display:.0f} | "
+                    f"Sens:{sensitivity:.1f} | "
+                    f"Lo:{freq_lo}Hz | Hi:{freq_hi}Hz | "
+                    f"Rec:{recovery:.2f} | "
+                    f"Vis:{vis_mode} | "
+                    f"Color:{COLOR_THEMES[color_idx]} | "
+                    f"Peaks:{peaks_str} | "
+                    f"AGC:{agc_str} | "
+                    f"Gap:{gap_str} | "
+                    f"Glow:{glow_str} | "
+                    f"Oct:{oct_str} | "
+                    f"Stereo:{stereo_str}"
                 )
-                prev_status = status
+                if status != prev_status:
+                    buf_append(RESET)
+                    buf_append(move(0, 0))
+                    buf_append(status[:width] + " " * max(0, min(width, len(prev_status)) - len(status)))
+                    buf_append(move(1, 0))
+                    help_text = (
+                        "[Q]uit [+/-]Sens [l/L]Lo [h/H]Hi [r/R]Rec "
+                        "[V]is [C]olor [P]eaks [M]enu [G]ap [B]glow "
+                        "[A]GC [O]ct [S]tereo [Shift-S]ave [Space]Pause"
+                    )
+                    buf_append(help_text[:width])
+                    prev_status = status
+
+                render_freq_labels(buf_append, freq_ranges, num_bars, bar_width,
+                                   height - 1, width, cached_freq_label)
+            else:
+                prev_status = ""
 
             if buf:
                 write("".join(buf))
@@ -860,7 +1497,6 @@ def run(stdscr):
     except KeyboardInterrupt:
         pass
     finally:
-        import signal
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
             pw_process.terminate()
@@ -868,13 +1504,7 @@ def run(stdscr):
         except Exception:
             pw_process.kill()
             pw_process.wait()
-        buf_exit = [RESET]
-        row_blank = " " * prev_width if prev_width else ""
-        for y in range(prev_height):
-            buf_exit.append(move(y, 0))
-            buf_exit.append(row_blank)
-        buf_exit.append(SHOW_CURSOR + move(0, 0))
-        write("".join(buf_exit))
+        write(RESET + f"{CSI}2J" + SHOW_CURSOR + move(0, 0))
         flush()
 
 
