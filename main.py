@@ -755,7 +755,7 @@ def run(stdscr):
                 prev_height, prev_width = height, width
                 num_bars = max(1, width // MIN_BAR_WIDTH)
                 bar_width = width // num_bars
-                max_bar_height = max(1, height - 4)
+                max_bar_height = max(1, height - 3)
                 prev_bar_heights = np.zeros(num_bars, dtype=int)
                 peak_heights = np.zeros(num_bars, dtype=float)
                 prev_wave_y = np.full(num_bars, height // 2, dtype=int)
@@ -793,7 +793,7 @@ def run(stdscr):
 
             # Build output buffer
             buf = []
-            base_y = height - 3
+            base_y = height - 1
             vis_mode = VIS_MODES[vis_idx]
             color_func = COLOR_FUNCS[COLOR_THEMES[color_idx]]
 
