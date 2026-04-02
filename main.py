@@ -7,6 +7,8 @@ import sys
 import os
 import math
 import signal
+import fcntl
+from collections import deque
 
 try:
     import tomllib
@@ -60,14 +62,6 @@ _BG_CACHE = [f"{CSI}48;5;{i}m" for i in range(256)]
 # Pre-compute dimmed color table: _DIM_CACHE[(color_id, factor_bucket)] -> color_id
 _DIM_CACHE = {}
 
-
-def _ensure_move_cache(max_y, max_x):
-    """Ensure move cache covers the given dimensions."""
-    for y in range(max_y):
-        for x in range(max_x):
-            k = (y, x)
-            if k not in _MOVE_CACHE:
-                _MOVE_CACHE[k] = f"{CSI}{y + 1};{x + 1}H"
 
 
 def move(y, x):
@@ -264,7 +258,6 @@ CONFIG_DEFAULTS = {
     "glow_bg": False,
     "agc": False,
     "octave_grouping": False,
-    "stereo": False,
 }
 
 
@@ -328,22 +321,26 @@ def find_default_sink():
 
 def build_freq_ranges(num_bars, freq_lo, freq_hi):
     """Pre-compute FFT bin ranges for each bar using log frequency mapping.
-    Returns list of (start_bin, end_bin) tuples. Each bar averages its range."""
+    Returns list of (start_bin, end_bin) tuples with fractional bin positions
+    to allow interpolation at low frequencies."""
     hz_per_bin = RATE / CHUNK
     log_lo = np.log10(max(freq_lo, 1))
     log_hi = np.log10(max(freq_hi, 2))
     edges = 10 ** np.linspace(log_lo, log_hi, num_bars + 1)
-    bin_edges = np.clip((edges / hz_per_bin).astype(int), 1, HALF_CHUNK - 1)
+    bin_edges = np.clip(edges / hz_per_bin, 1.0, HALF_CHUNK - 1.0)
     ranges = []
     for i in range(num_bars):
         lo = bin_edges[i]
-        hi = max(lo + 1, bin_edges[i + 1])
+        hi = bin_edges[i + 1]
+        if hi <= lo:
+            hi = lo + 1.0
         ranges.append((lo, hi))
     return ranges
 
 
 def build_freq_ranges_octave(num_bars, freq_lo, freq_hi):
-    """Octave-weighted FFT bin ranges. Each octave gets equal visual width."""
+    """Octave-weighted FFT bin ranges. Each octave gets equal visual width.
+    Returns fractional bin positions for interpolation."""
     hz_per_bin = RATE / CHUNK
     if freq_hi <= freq_lo:
         return build_freq_ranges(num_bars, freq_lo, freq_hi)
@@ -356,22 +353,67 @@ def build_freq_ranges_octave(num_bars, freq_lo, freq_hi):
         sub_bars = min(bars_per_octave, num_bars - len(ranges))
         edges = np.linspace(oct_lo, oct_hi, sub_bars + 1)
         for j in range(sub_bars):
-            lo_bin = max(1, int(edges[j] / hz_per_bin))
-            hi_bin = max(lo_bin + 1, int(edges[j + 1] / hz_per_bin))
-            ranges.append((lo_bin, min(hi_bin, HALF_CHUNK - 1)))
+            lo_bin = max(1.0, edges[j] / hz_per_bin)
+            hi_bin = max(lo_bin + 0.001, edges[j + 1] / hz_per_bin)
+            ranges.append((lo_bin, min(hi_bin, float(HALF_CHUNK - 1))))
         oct_lo = oct_hi
     while len(ranges) < num_bars:
-        ranges.append(ranges[-1] if ranges else (1, 2))
+        ranges.append(ranges[-1] if ranges else (1.0, 2.0))
     return ranges[:num_bars]
 
 
-def compute_amplitudes_vectorized(smoothed, freq_ranges, sensitivity):
-    """Vectorized amplitude computation — avoids per-bar Python loop."""
+def precompute_amplitude_tables(freq_ranges, smoothed_len):
+    """Pre-compute arrays for vectorized amplitude computation.
+    Call once when freq_ranges changes, not every frame."""
     n = len(freq_ranges)
-    result = np.empty(n)
+    max_bin = smoothed_len - 1
+    lo_f_arr = np.empty(n)
+    hi_f_arr = np.empty(n)
     for i in range(n):
-        lo, hi = freq_ranges[i]
-        result[i] = smoothed[lo:hi].mean()
+        lo_f_arr[i], hi_f_arr[i] = freq_ranges[i]
+    lo_i = lo_f_arr.astype(np.intp)
+    hi_i = hi_f_arr.astype(np.intp)
+    span = hi_i - lo_i
+
+    # Narrow bars (same bin or one bin boundary) — use interpolation
+    # Wide bars — use slice mean (still needs a loop but only for wide bars)
+    narrow_mask = span <= 1
+    wide_mask = ~narrow_mask
+
+    # For narrow bars: interpolation between bin and bin+1
+    # midpoint fractional position within the bin
+    mid_frac = (lo_f_arr + hi_f_arr) * 0.5
+    b0 = np.clip(lo_i, 0, max_bin)
+    b1 = np.clip(lo_i + 1, 0, max_bin)
+    frac = mid_frac - lo_i  # weight for b1
+    np.clip(frac, 0.0, 1.0, out=frac)
+
+    # For wide bars: integer bin ranges
+    wide_indices = np.where(wide_mask)[0]
+    wide_lo = np.clip(lo_i[wide_mask], 0, max_bin)
+    wide_hi = np.clip(hi_i[wide_mask], 0, max_bin + 1)
+
+    return {
+        "n": n, "narrow_mask": narrow_mask,
+        "b0": b0, "b1": b1, "frac": frac,
+        "wide_indices": wide_indices, "wide_lo": wide_lo, "wide_hi": wide_hi,
+    }
+
+
+def compute_amplitudes_vectorized(smoothed, amp_tables, sensitivity):
+    """Vectorized amplitude computation with fractional bin interpolation."""
+    t = amp_tables
+    result = np.empty(t["n"])
+
+    # Narrow bars: vectorized linear interpolation (no Python loop)
+    f = t["frac"]
+    result[:] = smoothed[t["b0"]] * (1.0 - f) + smoothed[t["b1"]] * f
+
+    # Wide bars: slice means (Python loop only for bars spanning multiple bins)
+    for k in range(len(t["wide_indices"])):
+        idx = t["wide_indices"][k]
+        result[idx] = smoothed[t["wide_lo"][k]:t["wide_hi"][k]].mean()
+
     result *= sensitivity
     return result
 
@@ -888,35 +930,26 @@ def render_stellar(buf_append, amplitudes, num_bars, bar_width, height, width,
 
 
 def render_vu(buf_append, amplitudes, raw_data, height, width, color_func,
-              vu_state, stereo_mode, data_l=None, data_r=None):
+              vu_state):
     """Classic VU meter with dB markings and peak hold."""
     _mv = move
-    if stereo_mode and data_l is not None and data_r is not None:
-        rms_l = np.sqrt(np.mean(data_l.astype(np.float64) ** 2)) / 32768.0
-        rms_r = np.sqrt(np.mean(data_r.astype(np.float64) ** 2)) / 32768.0
-    else:
-        rms_val = np.sqrt(np.mean(raw_data.astype(np.float64) ** 2)) / 32768.0
-        rms_l = rms_r = rms_val
+    rms_val = np.sqrt(np.mean(raw_data.astype(np.float64) ** 2)) / 32768.0
 
     db_min, db_max = -60.0, 0.0
-    db_l = max(db_min, 20.0 * math.log10(max(rms_l, 1e-10)))
-    db_r = max(db_min, 20.0 * math.log10(max(rms_r, 1e-10)))
+    db_val = max(db_min, 20.0 * math.log10(max(rms_val, 1e-10)))
 
     db_range = db_max - db_min
-    level_l = (db_l - db_min) / db_range
-    level_r = (db_r - db_min) / db_range
+    level = (db_val - db_min) / db_range
 
     # Peak hold
-    for key_l, key_h, level in [("peak_l", "peak_l_hold", level_l),
-                                 ("peak_r", "peak_r_hold", level_r)]:
-        if level >= vu_state.get(key_l, 0):
-            vu_state[key_l] = level
-            vu_state[key_h] = 30
-        else:
-            hold = vu_state.get(key_h, 0) - 1
-            vu_state[key_h] = hold
-            if hold <= 0:
-                vu_state[key_l] = max(level, vu_state.get(key_l, 0) - 0.02)
+    if level >= vu_state.get("peak", 0):
+        vu_state["peak"] = level
+        vu_state["peak_hold"] = 30
+    else:
+        hold = vu_state.get("peak_hold", 0) - 1
+        vu_state["peak_hold"] = hold
+        if hold <= 0:
+            vu_state["peak"] = max(level, vu_state.get("peak", 0) - 0.02)
 
     meter_width = width - 10
     if meter_width < 10:
@@ -968,12 +1001,7 @@ def render_vu(buf_append, amplitudes, raw_data, height, width, color_func,
                 scale_str[pos + ci] = ch
     buf_append("    " + "".join(scale_str))
 
-    if stereo_mode:
-        cy = height // 2
-        draw_meter(cy - 1, level_l, vu_state.get("peak_l", 0), "L")
-        draw_meter(cy + 1, level_r, vu_state.get("peak_r", 0), "R")
-    else:
-        draw_meter(height // 2, level_l, vu_state.get("peak_l", 0), "M")
+    draw_meter(height // 2, level, vu_state.get("peak", 0), "M")
 
 
 def render_radial(buf_append, amplitudes, num_bars, height, width, color_func,
@@ -1067,15 +1095,48 @@ def render_freq_labels(buf_append, freq_ranges, num_bars, bar_width, label_y,
     buf_append(result)
 
 
-def start_pw_record(sink, channels):
-    """Start pw-record process with given channel count."""
-    return subprocess.Popen(
+def start_pw_record(sink):
+    """Start pw-record process for mono capture."""
+    proc = subprocess.Popen(
         ['pw-record', '--raw', '--target', sink,
          '--media-category', 'Capture',
          '--format', 's16', '--rate', str(RATE),
-         '--channels', str(channels), '-'],
+         '--channels', '1', '-'],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
+    # Set stdout to non-blocking so we can drain the pipe buffer
+    fd = proc.stdout.fileno()
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    return proc
+
+
+def _drain_pipe(pipe, bytes_needed):
+    """Read all available data from a non-blocking pipe, return the last
+    chunk-sized segment. This discards stale buffered audio so the
+    visualizer always shows the most recent data."""
+    buf = b""
+    fd = pipe.fileno()
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            buf += chunk
+        except BlockingIOError:
+            break
+    if not buf:
+        # Nothing available yet — do a blocking read for one chunk
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
+            buf = pipe.read(bytes_needed)
+            fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+        except Exception:
+            return None
+    if len(buf) >= bytes_needed:
+        # Return only the last complete chunk
+        return buf[-(len(buf) // bytes_needed * bytes_needed):][-bytes_needed:]
+    return buf
 
 
 def run(stdscr):
@@ -1093,8 +1154,6 @@ def run(stdscr):
 
     # Audio state
     smoothed = np.zeros(HALF_CHUNK)
-    smoothed_l = np.zeros(HALF_CHUNK)
-    smoothed_r = np.zeros(HALF_CHUNK)
     sensitivity = cfg["sensitivity"]
     pause = False
 
@@ -1121,10 +1180,9 @@ def run(stdscr):
     glow_bg = cfg["glow_bg"]
     agc_enabled = cfg["agc"]
     octave_grouping = cfg["octave_grouping"]
-    stereo_mode = cfg["stereo"]
 
     # AGC state
-    agc_peak_history = []
+    agc_peak_history = deque(maxlen=AGC_WINDOW)
     agc_gain = 1.0
 
     # VU state
@@ -1143,8 +1201,7 @@ def run(stdscr):
         print("No audio output sink found. Make sure PipeWire is running.")
         sys.exit(1)
 
-    channels = 2 if stereo_mode else 1
-    pw_process = start_pw_record(sink, channels)
+    pw_process = start_pw_record(sink)
 
     # Pre-computed tables
     prev_height = prev_width = 0
@@ -1167,6 +1224,7 @@ def run(stdscr):
     frame_count = 0
     prev_radial_cells = set()
     cached_freq_label = {}
+    amp_tables = None
 
     global _color_cache, _color_cache_theme
 
@@ -1232,20 +1290,6 @@ def run(stdscr):
                     octave_grouping = not octave_grouping
                     freq_dirty = True
                     force_clear = True
-                elif key == 's':
-                    stereo_mode = not stereo_mode
-                    pw_process.terminate()
-                    try:
-                        pw_process.wait(timeout=3)
-                    except Exception:
-                        pw_process.kill()
-                        pw_process.wait()
-                    channels = 2 if stereo_mode else 1
-                    pw_process = start_pw_record(sink, channels)
-                    smoothed[:] = 0
-                    smoothed_l[:] = 0
-                    smoothed_r[:] = 0
-                    force_clear = True
                 elif key == 'S':
                     save_config({
                         "sensitivity": round(sensitivity, 2),
@@ -1260,7 +1304,6 @@ def run(stdscr):
                         "glow_bg": glow_bg,
                         "agc": agc_enabled,
                         "octave_grouping": octave_grouping,
-                        "stereo": stereo_mode,
                     })
             except Exception:
                 pass
@@ -1269,48 +1312,23 @@ def run(stdscr):
                 time.sleep(FRAME_TIME)
                 continue
 
-            # Read audio
-            data_l = data_r = None
-            one_minus_rec = 1 - recovery
-            if stereo_mode:
-                bytes_needed = CHUNK * 4
-                raw = pw_process.stdout.read(bytes_needed)
-                if not raw or len(raw) < bytes_needed:
-                    data = np.zeros(CHUNK, dtype=np.int16)
-                    data_l = data_r = np.zeros(CHUNK, dtype=np.int16)
-                else:
-                    interleaved = np.frombuffer(raw, dtype=np.int16)
-                    data_l = interleaved[0::2]
-                    data_r = interleaved[1::2]
-                    data = ((data_l.astype(np.int32) + data_r.astype(np.int32)) >> 1).astype(np.int16)
-
-                spectrum_l = np.abs(np.fft.rfft(data_l)) * NORM_FACTOR
-                spectrum_r = np.abs(np.fft.rfft(data_r)) * NORM_FACTOR
-                smoothed_l *= recovery
-                smoothed_l += spectrum_l[:HALF_CHUNK] * one_minus_rec
-                smoothed_r *= recovery
-                smoothed_r += spectrum_r[:HALF_CHUNK] * one_minus_rec
-
-                spectrum = np.abs(np.fft.rfft(data)) * NORM_FACTOR
-                smoothed *= recovery
-                smoothed += spectrum[:HALF_CHUNK] * one_minus_rec
+            # Read audio — drain pipe buffer to always use freshest data
+            one_minus_rec = 1.0 - recovery
+            bytes_needed = CHUNK * 2
+            raw = _drain_pipe(pw_process.stdout, bytes_needed)
+            if not raw or len(raw) < bytes_needed:
+                data = np.zeros(CHUNK, dtype=np.int16)
             else:
-                bytes_needed = CHUNK * 2
-                raw = pw_process.stdout.read(bytes_needed)
-                if not raw or len(raw) < bytes_needed:
-                    data = np.zeros(CHUNK, dtype=np.int16)
-                else:
-                    data = np.frombuffer(raw, dtype=np.int16)
+                data = np.frombuffer(raw, dtype=np.int16)
 
-                spectrum = np.abs(np.fft.rfft(data)) * NORM_FACTOR
-                smoothed *= recovery
-                smoothed += spectrum[:HALF_CHUNK] * one_minus_rec
+            spectrum = np.abs(np.fft.rfft(data)) * NORM_FACTOR
+            np.multiply(smoothed, recovery, out=smoothed)
+            smoothed += spectrum[:HALF_CHUNK] * one_minus_rec
 
             # Check terminal size
             height, width = stdscr.getmaxyx()
             if height != prev_height or width != prev_width:
                 prev_height, prev_width = height, width
-                _ensure_move_cache(height, width)
                 stride = MIN_BAR_WIDTH + (1 if bar_gap else 0)
                 num_bars = max(1, width // stride)
                 bar_width = width // num_bars
@@ -1342,30 +1360,23 @@ def run(stdscr):
                     freq_ranges = build_freq_ranges_octave(num_bars, freq_lo, freq_hi)
                 else:
                     freq_ranges = build_freq_ranges(num_bars, freq_lo, freq_hi)
+                amp_tables = precompute_amplitude_tables(freq_ranges, HALF_CHUNK)
                 freq_dirty = False
                 cached_freq_label.clear()
 
             # Compute bar amplitudes
-            amplitudes = compute_amplitudes_vectorized(smoothed, freq_ranges, sensitivity)
+            amplitudes = compute_amplitudes_vectorized(smoothed, amp_tables, sensitivity)
 
             # AGC
             if agc_enabled:
                 current_peak = amplitudes.max() if len(amplitudes) > 0 else 0
                 agc_peak_history.append(current_peak)
-                if len(agc_peak_history) > AGC_WINDOW:
-                    agc_peak_history.pop(0)
                 recent_peak = max(agc_peak_history) if agc_peak_history else 1.0
                 if recent_peak > 0.001:
                     target_gain = AGC_TARGET / (recent_peak * max_bar_height * 3)
                     agc_gain += (target_gain - agc_gain) * 0.05
                     agc_gain = max(0.1, min(agc_gain, 20.0))
                 amplitudes = amplitudes * agc_gain
-
-            # Stereo amplitudes
-            if stereo_mode:
-                gain_mult = sensitivity * (agc_gain if agc_enabled else 1.0)
-                amplitudes_l = compute_amplitudes_vectorized(smoothed_l, freq_ranges, gain_mult)
-                amplitudes_r = compute_amplitudes_vectorized(smoothed_r, freq_ranges, gain_mult)
 
             # Bar heights (float for sub-character rendering)
             mbh3 = max_bar_height * 3.0
@@ -1391,12 +1402,6 @@ def run(stdscr):
                 _color_cache_theme = theme_key
 
             if vis_mode == "bars":
-                if stereo_mode:
-                    half = num_bars // 2
-                    combined_amp = np.empty(num_bars)
-                    combined_amp[:half] = amplitudes_l[:half]
-                    combined_amp[half:] = amplitudes_r[:num_bars - half]
-                    bar_heights_f = np.minimum(combined_amp * mbh3, fmbh)
                 render_bars(buf_append, bar_heights_f, prev_bar_heights, num_bars,
                             bar_width, draw_width, max_bar_height, base_y,
                             color_func, block_char, peak_heights,
@@ -1432,7 +1437,7 @@ def run(stdscr):
                                width, particles, color_func, frame_count)
             elif vis_mode == "vu":
                 render_vu(buf_append, amplitudes, data, height, width, color_func,
-                          vu_state, stereo_mode, data_l, data_r)
+                          vu_state)
             elif vis_mode == "radial":
                 render_radial(buf_append, amplitudes, num_bars, height, width,
                               color_func, frame_count, prev_radial_cells)
@@ -1456,7 +1461,6 @@ def run(stdscr):
                 gap_str = "on" if bar_gap else "off"
                 glow_str = "on" if glow_bg else "off"
                 oct_str = "on" if octave_grouping else "off"
-                stereo_str = "on" if stereo_mode else "off"
                 status = (
                     f"FPS:{fps_display:.0f} | "
                     f"Sens:{sensitivity:.1f} | "
@@ -1468,8 +1472,7 @@ def run(stdscr):
                     f"AGC:{agc_str} | "
                     f"Gap:{gap_str} | "
                     f"Glow:{glow_str} | "
-                    f"Oct:{oct_str} | "
-                    f"Stereo:{stereo_str}"
+                    f"Oct:{oct_str}"
                 )
                 if status != prev_status:
                     buf_append(RESET)
@@ -1479,7 +1482,7 @@ def run(stdscr):
                     help_text = (
                         "[Q]uit [+/-]Sens [l/L]Lo [h/H]Hi [r/R]Rec "
                         "[V]is [C]olor [P]eaks [M]enu [G]ap [B]glow "
-                        "[A]GC [O]ct [S]tereo [Shift-S]ave [Space]Pause"
+                        "[A]GC [O]ct [Shift-S]ave [Space]Pause"
                     )
                     buf_append(help_text[:width])
                     prev_status = status
@@ -1492,8 +1495,6 @@ def run(stdscr):
             if buf:
                 write("".join(buf))
                 flush()
-
-            time.sleep(FRAME_TIME)
     except KeyboardInterrupt:
         pass
     finally:
